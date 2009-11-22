@@ -13,13 +13,17 @@ The code is consolidated into a single 'redis' package and various elements of i
 
 ## quickstart
 
-Presuming you already have both Go and Redis installed and a running local Redisserver:
+Presuming you already have both Go and Redis installed and a running local Redis server:
 
 cd src/pkg/redis
+
 make
+
 cd ../../../bench
 
+
 ./runbench synchclient
+
 ./runbench gosynchclient
 
 
