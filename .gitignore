@@ -1,0 +1,12 @@
+# general hidden files/directories
+
+.DS_Store
+.sconsign*
+.svn
+
+# file patterns
+
+*.8
+*.6
+*.out
+*.o
