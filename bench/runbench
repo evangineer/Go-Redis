@@ -1,3 +1,18 @@
-6g -I ./../src/pkg/redis $*.go
-6l -o $1 $*.6
+# Test if we are on the amd64 architecture, if not use the 386 toolchain
+if [ "$GOARCH" != 'amd64' ]; then
+        GOCOMPILE=8g
+        GOLINK=8l
+        GOEXT=8
+else
+        GOCOMPILE=6g
+        GOLINK=6l
+        GOEXT=6
+fi
+
+echo $GOCOMPILE
+echo $GOLINK
+echo $GOEXT
+
+$GOCOMPILE -I ./../src/pkg/redis $*.go
+$GOLINK -o $1 $*.$GOEXT
 ./$1
