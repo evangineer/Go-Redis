@@ -9,10 +9,6 @@ else
         GOEXT=6
 fi
 
-echo $GOCOMPILE
-echo $GOLINK
-echo $GOEXT
-
 $GOCOMPILE -I ./../src/pkg/redis $*.go
 $GOLINK -o $1 $*.$GOEXT
 ./$1
