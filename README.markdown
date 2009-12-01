@@ -24,4 +24,3 @@ Presuming you already have both Go and Redis installed and a running local Redis
 
 [Go]: http://golang.org/
 [Redis]: http://github.com/antirez/redis
-

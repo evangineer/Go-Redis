@@ -1,9 +1,9 @@
 include $(GOROOT)/src/Make.$(GOARCH)
 
 TARG=redis
-REDIS_FILES=\
+GOFILES=\
 	reflect.go\
-	sync.go\
+	future.go\
 	specification.go\
 	error.go\
 	redis.go\
@@ -12,8 +12,8 @@ REDIS_FILES=\
 	synchclient.go\
     asynchclient.go\
 
-$(TARG).$(O): $(REDIS_FILES)
-	$(GC) -o $(TARG).$(O) $(REDIS_FILES)
+$(TARG).$(O): $(GOFILES)
+	$(GC) -o $(TARG).$(O) $(GOFILES)
         
 include $(GOROOT)/src/Make.pkg
 

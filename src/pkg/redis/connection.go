@@ -17,7 +17,6 @@ package redis
 import (
 	"net";
 	"fmt";
-	"strconv";
 	"os";
 	"io";
 	"bufio";
@@ -28,14 +27,14 @@ import (
 const (
 	TCP = "tcp";
 	LOCALHOST = "127.0.0.1";
-	ns1Sec = 1000000;
-	ns1MSec = 1000;
+	ns1MSec = 1000000;
+	ns1Sec = ns1MSec * 1000;
 )
 
 // various default sizes for the connections
 // exported for user convenience if nedded
 const(
-	DefaultReqChanSize			= 100000;
+	DefaultReqChanSize			= 1000000;
 	DefaultRespChanSize			= 1000000;
 	
 	DefaultTCPReadBuffSize		= 1024 * 256;
@@ -44,6 +43,7 @@ const(
 	DefaultTCPWriteTimeoutNSecs	= ns1Sec * 10;
 	DefaultTCPLinger			= 0;
 	DefaultTCPKeepalive			= true;
+	DefaultHeartbeatSecs		= 1;
 )
 
 // Redis specific default settings
@@ -73,8 +73,10 @@ type ConnectionSpec struct {
 	keepalive	bool;
 	lingerspec	int; // -n: finish io; 0: discard, +n: wait for n secs to finish
 	// async specs
-	reqChanCap int;
+	reqChanCap	int;
 	rspChanCap  int; 
+	// 
+	heartbeat	int64; // 0 means no heartbeat
 }
 
 // Creates a ConnectionSpec using default settings.
@@ -92,7 +94,8 @@ func DefaultSpec () *ConnectionSpec {
 		DefaultTCPKeepalive,
 		DefaultTCPLinger,
 		DefaultReqChanSize,
-		DefaultRespChanSize
+		DefaultRespChanSize,
+		DefaultHeartbeatSecs
 	};
 }
 
@@ -125,9 +128,9 @@ func (spec *ConnectionSpec) Password(password string) *ConnectionSpec {
 }
 
 // return the address as string.
-func (spec *ConnectionSpec) Addr () string {
-	return spec.host + ":" + strconv.Itoa(int(spec.port));
-//	return fmt.Sprintf("%s:%d", spec.host, spec.port);
+func (spec *ConnectionSpec) Heartbeat (seconds int64) *ConnectionSpec {
+	spec.heartbeat = seconds;
+	return spec;
 }
 
 // ----------------------------------------------------------------------------
@@ -138,7 +141,7 @@ func (spec *ConnectionSpec) Addr () string {
 //
 type connHdl struct {
 	spec 	*ConnectionSpec;
-	conn 	net.Conn;
+	conn 	net.Conn;			// may want to change this to TCPConn
 	reader 	*bufio.Reader;
 }
 
@@ -146,13 +149,13 @@ type connHdl struct {
 // The new connection is wrapped by a new connHdl with its bufio.Reader
 // delegating to the net.Conn's reader. 
 //
-func newConnHDL (spec *ConnectionSpec) (hdl *connHdl, err os.Error) {
-	here := "newConnHDL";
+func newConnHdl (spec *ConnectionSpec) (hdl *connHdl, err os.Error) {
+	here := "newConnHdl";
 
 	if hdl = new(connHdl); hdl == nil { 
 		return nil, withNewError (fmt.Sprintf("%s(): failed to allocate connHdl", here));
 	}
-	addr := spec.Addr(); 
+	addr := fmt.Sprintf("%s:%d", spec.host, spec.port); 
 	raddr, e:= net.ResolveTCPAddr(addr); 
 	if e != nil {
 		return nil, withNewError (fmt.Sprintf("%s(): failed to resolve remote address %s", here, addr));
@@ -208,14 +211,13 @@ func (hdl connHdl) Close() os.Error {
 // connections.
 
 type SyncConnection interface {
-//	ServiceRequest (cmd *Command, args ...) (Response, Error);
 	ServiceRequest (cmd *Command, args [][]byte) (Response, Error);
 	Close () os.Error;
 }
 
 // Creates a new SyncConnection using the provided ConnectionSpec
 func NewSyncConnection (spec *ConnectionSpec) (c SyncConnection, err os.Error) {
-	return newConnHDL (spec);
+	return newConnHdl (spec);
 }
 
 // Implementation of SyncConnection.ServiceRequest.
@@ -253,259 +255,443 @@ func (chdl *connHdl) ServiceRequest (cmd *Command, args [][]byte) (resp Response
 // Asynchronous connections
 // ----------------------------------------------------------------------------
 
-type arErrStat byte;
+type status_code byte;
 const (
-    _       arErrStat = iota;
+    ok       status_code = iota;
+	info;
+	warning;
+	error;
+	reqerr;
     inierr;
     snderr;
     rcverr;
 )
 
-// Defines the service contract supported by asynchronous (Request/FutureReply)
-// connections.
+type interrupt_code byte;
+const (
+	_	interrupt_code = iota;
+	// connection process control
+	start;
+	pause;
+	stop;
+)
+type workerCtl chan interrupt_code;
 
-type AsyncConnection interface {
-//	QueueRequest (cmd *Command, args ...) (*PendingResponse, Error);
-	QueueRequest (cmd *Command, args [][]byte) (*PendingResponse, Error);
+type event_code byte;
+const (
+	_			event_code = iota;
+	ready;
+	working;
+	faulted;
+)
+
+type workerStatus struct {
+	id			int;
+	event		event_code;
+	taskinfo	*taskStatus; 
+	ctlchan		*workerCtl;
 }
-
-// Handle to a future response
-type PendingResponse struct {
-	future interface{}
+type taskStatus struct {
+	code	status_code;
+	error	os.Error;
 }
+var ok_status = taskStatus{ok, nil};
 
-// Creates and opens a new AsyncConnection and starts the goroutines for 
-// request and response processing
-
-func NewAsynchConnection (spec *ConnectionSpec) (AsyncConnection, os.Error) {
-	async, err:= newAsyncConnHdl(spec);
-	go async.batchProcessRequests ();
-	go async.processResponses();
-	return async, err;
-}
+type workerTask	func (*asyncConnHdl, workerCtl) (*interrupt_code, *taskStatus);
 
 // Defines the data corresponding to a requested service call through the
 // QueueRequest method of AsyncConnection
 // not used yet.
 type asyncRequestInfo struct {
 	id			int64;
-	stat		arErrStat;
+	stat		status_code;
 	cmd			*Command;
 	outbuff		*[]byte;
 	future		interface{};
 	error		Error;
 }
-
-//type asyncRequest struct {
-//	ref		*asyncRequestInfo;
-//}
-type asyncRequest *asyncRequestInfo;
+type asyncReqPtr *asyncRequestInfo;
 
 // control structure used by asynch connections.
-
+const (
+	heartbeatworker int = iota;
+	manager;
+	requesthandler;
+	responsehandler;
+)
 type asyncConnHdl struct {
 	super			*connHdl;
 	writer			*bufio.Writer;
-	pending_reqs 	chan asyncRequest;
-	pending_resps 	chan asyncRequest;	
 	
 	nextid			int64;
-	/*
-	// TODO: we'll need these so the go routines can coordinate (on lifecycle and error
-	// events) with the AsyncConnection	
+	pendingReqs 	chan asyncReqPtr;
+	pendingResps 	chan asyncReqPtr;
+	faults			chan asyncReqPtr;
 	
-	req_handler  chan interface{};
-	resp_handler chan interface{};
-	*/
+	reqProcCtl		workerCtl;
+	rspProcCtl		workerCtl;
+	heartbeatCtl	workerCtl;
+	managerCtl		workerCtl;
+	
+	feedback		chan workerStatus;
+	
+	shutdown		chan bool;
 }
 
 // Creates a new asyncConnHdl with a new connHdl as its delegated 'super'.
 // Note it does not start the processing goroutines for the channels.
 
 func newAsyncConnHdl (spec *ConnectionSpec) (async *asyncConnHdl, err os.Error) {
-	here := "newAsynConnHDL";
-	super, err := newConnHDL (spec);
-	if err == nil {
+//	here := "newAsynConnHDL";
+	super, err := newConnHdl (spec);
+	if err == nil && super != nil {
 		async = new(asyncConnHdl);
 		if async != nil { 
 			async.super = super;
 			async.writer, err = bufio.NewWriterSize(super.conn, spec.wBufSize);
 			if err == nil {
-				async.pending_reqs = make (chan asyncRequest, spec.reqChanCap);
-				async.pending_resps = make (chan asyncRequest, spec.rspChanCap);
+				async.pendingReqs = make (chan asyncReqPtr, spec.reqChanCap);
+				async.pendingResps = make (chan asyncReqPtr, spec.rspChanCap);
+				async.faults = make (chan asyncReqPtr, spec.reqChanCap); // not sure about sizing here ...
 				
-				if debug() {
-					fmt.Printf("newAsyncConnHdl:\n");
-					fmt.Printf("\tasyncConnHdl:%+v\n", async);
-					fmt.Printf("\tsuper:%+v\n", super);
-					fmt.Printf("\tspec:%+v\n", spec);
-				}
+				async.reqProcCtl = make (workerCtl);
+				async.rspProcCtl = make (workerCtl);
+				async.heartbeatCtl = make (workerCtl);
+				async.managerCtl = make (workerCtl);
+				
+				async.feedback = make (chan workerStatus);
+				async.shutdown = make (chan bool, 1);
+
+				
+				return;
 			} 
-			else {
-				return nil, withOsError (fmt.Sprintf("%s(): NewWriterSize(%d) error", here, spec.wBufSize), err);
-			}
+			else { super.conn.Close(); }
 		} 
-		else {
-			return nil, withNewError (fmt.Sprintf("%s(): failed to allocate asyncConnHdl", here));
-		}
 	} 
-	else {
-		return nil, withOsError (fmt.Sprintf("%s(): Error creating connHdl", here), err);
+	// fall through here on errors only
+	if err == nil { err =  os.NewError("Error creating asyncConnHdl"); } 
+	return nil, err;
+}
+
+// Creates and opens a new AsyncConnection and starts the goroutines for 
+// request and response processing
+
+func NewAsynchConnection (spec *ConnectionSpec) (conn AsyncConnection, err os.Error) {
+	var async *asyncConnHdl;
+	if async, err = newAsyncConnHdl(spec); err == nil { 
+		async.startup();
 	}
-			
-	return;
-}
-func (c *asyncConnHdl) nextId () (id int64) {
-	id = c.nextid;
-	c.nextid++;
-	return;
+	return async, err;
 }
 
-// TODO: error processing
-func (c *asyncConnHdl) batchProcessRequests ()  {
-	if debug () {log.Stdout("begin processing requests for connection [using glued-writes]: ", c);}
+// responsible for managing the various moving parts of the asyncConnHdl
+func (c *asyncConnHdl) startup ()  {
+//	log.Stdout("connection manager -- begin");
 
-	var err os.Error;
-	var errmsg string;
+	go c.worker (manager, "manager", managementTask, c.managerCtl, nil); 
+	c.managerCtl<- start;
 	
-	for {
-		bytecnt := 0;
-		blen, err:= c.processAsyncRequest ();
+	go c.worker (heartbeatworker, "heartbeat", heartbeatTask, c.heartbeatCtl, c.feedback); 
+	c.heartbeatCtl<- start;
+	
+	go c.worker (heartbeatworker, "request-processor", reqProcessingTask, c.reqProcCtl, c.feedback); 
+	c.reqProcCtl<- start;
+	
+	go c.worker (heartbeatworker, "response-processor", rspProcessingTask, c.rspProcCtl, c.feedback); 
+	c.rspProcCtl<- start;
+	
+	log.Stdout("Connection started ...");
+}
+
+// This could find a happy home in a generalized worker package ...
+// TODO
+func (c *asyncConnHdl) worker (id int, name string, task workerTask, ctl workerCtl, fb chan workerStatus)  {
+	var signal	 interrupt_code;
+	var tstat	*taskStatus;
+	
+	// todo: add startup hook for worker
+	
+	await_signal:
+		log.Stdout(name, "_worker: await_signal.");
+		signal = <- ctl;
+	
+	on_interrupt: 
+//		log.Stdout(name, "_worker: on_interrupt: ", signal);
+		switch signal {
+		case stop:  goto before_stop;
+		case pause: goto await_signal;
+		case start: goto work;
+		}
+				
+	work:
+//		log.Stdout(name, "_worker: work!");
+		select {
+		case signal = <-ctl:
+			goto on_interrupt;
+		default:
+			is, stat := task(c, ctl);  // todo is a task context type
+			if stat == nil { log.Stderr("<BUG> nil stat from worker ", name); }
+			if stat.code != ok { 
+				log.Stdout(name, "_worker: task error!");
+				tstat = stat;
+				goto on_error;  
+			}
+			else if is != nil { 
+				signal = *is;
+				goto on_interrupt; 
+			}
+			goto work;
+		}
+	
+	on_error:
+		log.Stdout(name, "_worker: on_error!");
+		// TODO: log it, send it, and go back to wait_start:
+		log.Stderr (name, "_worker task raised error: ", tstat);
+		fb<-workerStatus{id, faulted, tstat, &ctl};
+		goto await_signal;
+		
+	before_stop:
+		log.Stdout(name, "_worker: before_stop!");
+		// TODO: add shutdown hook for worker
+		
+	log.Stdout(name, "_worker: STOPPED!");
+}
+
+// ----------------------------------------------------------------------------
+// aync tasks
+// ----------------------------------------------------------------------------
+
+func managementTask (c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te *taskStatus) {
+/* TODO:
+connected:
+	clearChannels();
+	startWokers();
+disconnected:
+	?
+on_fault:
+	disconnect();
+	goto disconnected;
+on_exit:
+	?
+*/
+	log.Stderr("MGR: do task ...");
+	select {
+		case stat:= <-c.feedback:
+		log.Stderr("MGR: Feedback from one of my minions: ", stat);
+		// do the shutdown for now -- TODO: try reconnect
+		if stat.event == faulted {
+			log.Stderr("MGR: Shutting down due to fault in ", stat.id);
+			go func() { c.reqProcCtl <- stop; } ();
+			go func() { c.rspProcCtl <- stop; } ();
+			go func() { c.heartbeatCtl <- stop; } ();
+			
+			log.Stderr("MGR: Signal SHUTDOWN ... ");
+			c.shutdown <- true;
+			// stop self // TODO: should manager really be a task or a FSM?
+			c.managerCtl <- stop;
+		}
+	case s := <- ctl:
+		return &s, &ok_status;
+	}
+	
+	return nil, &ok_status;
+}
+
+// Task:
+// "One PING only" after receiving a timed tick per ConnectionsSpec period
+// - can be interrupted while waiting on ticker
+// - uses TryGet on PING response (1 sec as of now)
+//
+// KNOWN ISSUE:
+// possible connection is OK but TryGet timesout and now we just log a warning
+// but it is a good measure of latencies in the pipeline and perhaps could be used
+// to autoconfigure the params to decrease latencies ... TODO
+
+func heartbeatTask (c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te *taskStatus) {
+	var async AsyncConnection = c;
+	select {
+	case <-NewTimer (ns1Sec * c.super.spec.heartbeat): 
+		response, e := async.QueueRequest(&PING, [][]byte{});
+		if e != nil {
+			return nil, &taskStatus {reqerr, e};
+		}
+		stat, re, ok := response.future.(FutureBool).TryGet(ns1Sec);
+		if re != nil { 
+			log.Stderr ("ERROR: Heartbeat recieved error response on PING");
+			return nil, &taskStatus {error, re}; 
+		}
+		else if !ok {
+			log.Stderr ("Warning: Heartbeat timeout on get PING response.")
+		}
+		else {
+			// flytrap
+			if stat != true {
+				log.Stderr ("<BUG> Heartbeat recieved false stat on PING while response error was nil");
+				return nil, &taskStatus {error, NewError(SYSTEM_ERR, "BUG false stat on PING w/out error")}; 
+			}
+		}
+	case sig := <- ctl:
+		return &sig, &ok_status;
+	}
+	return nil, &ok_status;
+}
+
+// Task: 
+// process one pending response at a time
+// - can be interrupted while waiting on the pending responses queue
+// - buffered reader takes care of minimizing network io
+//
+// KNOWN BUG: 
+// until we figure out what's the problem with read timeout, can not 
+// be interrupted if hanging on a read
+func rspProcessingTask (c *asyncConnHdl, ctl workerCtl) (sig *interrupt_code, te *taskStatus) {
+
+	var req asyncReqPtr;	
+	select {
+	case sig := <- ctl:
+		// interrupted
+		return &sig, &ok_status;
+	case req = <-c.pendingResps:
+		// continue to process
+	}
+	
+	// process response to asyncRequest
+	reader:= c.super.reader;
+	cmd:= req.cmd;
+	
+	resp, e3:= GetResponse (reader, cmd);
+	if e3!= nil {
+		// system error
+		log.Stderr("<TEMP DEBUG> Request sent to faults chan on error in GetResponse: ", e3);
+		req.stat = rcverr;
+		req.error = NewErrorWithCause (SYSTEM_ERR, "GetResponse os.Error", e3);
+		c.faults <- req;
+		return nil, &taskStatus {rcverr, e3};
+	}
+	SetFutureResult (req.future, cmd, resp);
+
+	return nil, &ok_status;
+}
+
+// Pending further tests, this addresses bug in earlier version
+// and can be interrupted
+
+func reqProcessingTask (c *asyncConnHdl, ctl workerCtl) (ic *interrupt_code, ts *taskStatus) {
+
+	var err		os.Error;
+	var errmsg	string;
+	
+	bytecnt := 0;
+	blen	:= 0;
+	bufsize := c.super.spec.wBufSize;
+	var	sig interrupt_code;
+	
+	select {
+	case req := <-c.pendingReqs:
+		blen, err:= c.processAsyncRequest (req);
 		if err != nil {
 			errmsg = fmt.Sprintf("processAsyncRequest error in initial phase");
 			goto proc_error;
 		}
 		bytecnt += blen;
-
-		for len(c.pending_reqs) > 0 {
-			// blen == 0 means processAsyncRequest flushed
-			blen, err = c.processAsyncRequest ();
+	case sig := <- ctl:
+		return &sig, &ok_status;
+	}
+	
+	for bytecnt < bufsize {
+		select {
+		case req := <-c.pendingReqs:
+			blen, err = c.processAsyncRequest (req);
 			if err != nil {
 				errmsg = fmt.Sprintf("processAsyncRequest error in batch phase");
 				goto proc_error;
 			}
-			if (blen > 0) {
-				bytecnt += blen;
-				if bytecnt > c.super.spec.wBufSize { // i know ..
-					break;
-				}
-			}
+			if (blen > 0) { bytecnt += blen; }
 			else { bytecnt = 0; }
-		}
-		c.writer.Flush();
+
+		case sig = <-ctl:
+			ic = &sig;
+			goto done;
+		
+		default:
+			goto done;
+		}	
 	}
+	
+	done:
+		c.writer.Flush();
+		return ic, &ok_status;
 	
 	proc_error:
 		log.Stderr (errmsg, err);
-		// TODO: send signal to the conn control
-	
-	if debug () {log.Stdout("stopped processing requests for connection: ", c);}
+		return nil, &taskStatus {snderr, err};
 }
 
-// TODO: error processing
-func (c *asyncConnHdl) processAsyncRequest () (blen int, e os.Error) {
-	req := <-c.pending_reqs;
+func (c *asyncConnHdl) processAsyncRequest (req asyncReqPtr) (blen int, e os.Error) {
+//	req := <-c.pendingReqs;
 	req.id = c.nextId();
 	blen = len(*req.outbuff);
 	e = sendRequest(c.writer, *req.outbuff);
 	if e==nil {
 		req.outbuff = nil;
 		select {
-		case c.pending_resps <- req:
+		case c.pendingResps <- req:
 		default:
 			c.writer.Flush();  
-			c.pending_resps<- req;
+			c.pendingResps<- req;
 			blen = 0;
 		}
 	}
 	else {
-		log.Stderr("<BUG> lazy programmer >> ERROR in processRequest goroutine -req requeued");
+		log.Stderr("<BUG> lazy programmer >> ERROR in processRequest goroutine -req requeued for now");
 		// TODO: set stat on future & inform conn control and put it in fauls
-		c.pending_reqs<- req;
+		c.pendingReqs<- req;
 	}
 	return;
 }
 
-func (c *asyncConnHdl) processResponses () {
-	if debug () {log.Stdout("begin processing responses for connection: ", c);}
-	for {
-		req:= <-c.pending_resps;
-		reader:= c.super.reader;
-		cmd:= req.cmd;
-		
-		r, e3:= GetResponse (reader, cmd);
-		if e3!= nil {
-			log.Stderr("<BUG> lazy programmer hasn't addressed failures in processResponses goroutine");
-			log.Stderr(e3);
-			break;
-		}
-		
-		if r.IsError() {
-			errorResponse := NewRedisError(r.GetMessage());
-			req.future.(FutureResult).onError(errorResponse);
-		}
-		else {
-			switch cmd.RespType {
-			case BOOLEAN:
-				req.future.(FutureBool).set(r.GetBooleanValue());
 
-			case BULK: 			
-				req.future.(FutureBytes).set(r.GetBulkData());
+// ----------------------------------------------------------------------------
+// AsyncConnection interface & Impl
+// ----------------------------------------------------------------------------
 
-			case MULTI_BULK:	
-				req.future.(FutureBytesArray).set(r.GetMultiBulkData());
+// Defines the service contract supported by asynchronous (Request/FutureReply)
+// connections.
 
-			case NUMBER:			
-				req.future.(FutureInt64).set(r.GetNumberValue());
-
-			case STATUS:		
-				req.future.(FutureString).set(r.GetMessage());
-
-			case STRING:		
-				req.future.(FutureString).set(r.GetStringValue());
-
-		//	case VIRTUAL:		// FutureString?
-		//	    resp, err = getVirtualResponse ();
-			}
-		}
-	}
-	if debug () {log.Stdout("stopped processing responses for connection: ", c);}
+type AsyncConnection interface {
+	QueueRequest (cmd *Command, args [][]byte) (*PendingResponse, Error);
 }
 
+// Handle to a future response
+type PendingResponse struct {
+	future interface{}		// TODO: stop using runtime casts
+}
 
 func (c *asyncConnHdl) QueueRequest (cmd *Command, args [][]byte) (*PendingResponse, Error) {
-	var future interface{};
-	switch cmd.RespType {
-		case BOOLEAN:
-			future = newFutureBool();
-		case BULK: 			
-			future = newFutureBytes();
-		case MULTI_BULK:	
-			future = newFutureBytesArray();
-		case NUMBER:			
-			future = newFutureInt64();
-		case STATUS:		
-			future = newFutureString();
-		case STRING:		
-			future = newFutureString();
+	select {
+	case <- c.shutdown:
+		log.Stderr("<DEBUG> we're shutdown and not accepting any more requests ...");
+		return nil, NewError(SYSTEM_ERR, "Connection is shutdown.");
+	default: 
 	}
 	
-	// kickoff the process
-//	go func() {
-		request := &asyncRequestInfo{0, 0, cmd, nil, future, nil};
-		buff, e1 := CreateRequestBytes(cmd, args);
-		if e1 == nil {
-			request.outbuff = &buff;
-			c.pending_reqs<- request;
-		} 
-		else {
-			errmsg:= fmt.Sprintf("Failed to create asynchrequest - %s aborted", cmd.Code);	
-			request.stat = inierr;
-			request.error = NewErrorWithCause(SYSTEM_ERR, errmsg, e1);
-			request.future.(FutureResult).onError(request.error);		
-		}
-//	}();
+	future := CreateFuture (cmd);
 	
+	request := &asyncRequestInfo{0, 0, cmd, nil, future, nil};
+	buff, e1 := CreateRequestBytes(cmd, args);
+	if e1 == nil {
+		request.outbuff = &buff;
+		c.pendingReqs<- request;
+	} 
+	else {
+		errmsg:= fmt.Sprintf("Failed to create asynchrequest - %s aborted", cmd.Code);	
+		request.stat = inierr;
+		request.error = NewErrorWithCause(SYSTEM_ERR, errmsg, e1); // only makes sense if using go ...
+		request.future.(FutureResult).onError(request.error);	
+		
+		return nil, request.error; // remove if restoring go
+	}
+//}();	
 	// done.
 	return &PendingResponse {future}, nil;
 }
@@ -514,6 +700,13 @@ func (c *asyncConnHdl) QueueRequest (cmd *Command, args [][]byte) (*PendingRespo
 // internal ops
 // ----------------------------------------------------------------------------
 
+// request id needs to be unique in context of associated connection
+// only one goroutine calls this so no need to provide concurrency guards
+func (c *asyncConnHdl) nextId () (id int64) {
+	id = c.nextid;
+	c.nextid++;
+	return;
+}
 
 // Either writes all the bytes or it fails and returns an error
 //

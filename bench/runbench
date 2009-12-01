@@ -1,14 +1,3 @@
-# Test if we are on the amd64 architecture, if not use the 386 toolchain
-if [ "$GOARCH" != 'amd64' ]; then
-        GOCOMPILE=8g
-        GOLINK=8l
-        GOEXT=8
-else
-        GOCOMPILE=6g
-        GOLINK=6l
-        GOEXT=6
-fi
-
-$GOCOMPILE -I ./../src/pkg/redis $*.go
-$GOLINK -o $1 $*.$GOEXT
+rm -f $1
+make $1
 ./$1
